@@ -6,7 +6,7 @@ import org.apache.spark.sql.catalyst.rules.Rule
 
 object JoinOnKeys extends Rule[LogicalPlan] with Logging{
   override def apply(plan: LogicalPlan): LogicalPlan = {
-    logInfo(plan.verboseStringWithSuffix(10000))
+    logInfo(plan.verboseStringWithSuffix(1000))
     plan
   }
 }
