@@ -3,27 +3,62 @@ package cn.edu.ruc
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.{Rule, UnknownRuleId}
-import org.apache.spark.sql.catalyst.trees.TreePattern.{BINARY_COMPARISON, FILTER, INNER_LIKE_JOIN}
+import org.apache.spark.sql.catalyst.trees.TreePattern.{FILTER, JOIN}
 import org.apache.spark.sql.catalyst.plans.logical._
-import org.apache.spark.sql.catalyst.expressions.{Expression, BinaryComparison}
-import org.apache.spark.sql.catalyst.expressions.Literal.TrueLiteral
-import org.apache.spark.sql.catalyst.trees.TreePattern
+import org.apache.spark.sql.catalyst.expressions.{Expression, Or}
 
 object JoinOnKeys extends Rule[LogicalPlan] with Logging{
   override def apply(plan: LogicalPlan): LogicalPlan = {
-    plan.transformDownWithPruning(_.containsPattern(INNER_LIKE_JOIN), UnknownRuleId) {
+    plan.transformDownWithPruning(_.containsPattern(JOIN), UnknownRuleId) {
       case j @ Join(l: LogicalPlan, r: LogicalPlan, _, _, _) =>
-        logInfo(j.toString())
-        logInfo(l.toString())
-        logInfo(r.toString())
-        canFuse(l, r)
-        j
-//      case p @ Project(projectList, projectPlan: LogicalPlan) =>
-//        logInfo(projectPlan.toString())
-//        p
+        logInfo("Join detected")
+        logInfo(s"Left plan: ${l.toString()}")
+        logInfo(s"Right plan: ${l.toString()}")
+        fuseIfCan(j)
     }
   }
 
+  // 从逻辑计划中提取出所有的过滤条件
+  private def eliminateFilter(p: LogicalPlan): Map[LogicalPlan, Expression] = {
+    var filterMap: Map[LogicalPlan, Expression]= Map()
+    p.transformUpWithPruning(_.containsPattern(FILTER), UnknownRuleId) {
+      case f @ Filter(condition, child) =>
+        filterMap += (child -> condition)
+        child
+    }
+    filterMap
+  }
+
+
+  // 合并两个在同一个子计划上进行的过滤条件
+  private def fuseFilter(lFilterMap: Map[LogicalPlan, Expression], rFilterMap: Map[LogicalPlan, Expression]): Map[LogicalPlan, Expression] = {
+    var filterMap: Map[LogicalPlan, Expression] = Map()
+    lFilterMap.foreach { case (l, lFilter) =>
+      rFilterMap.foreach { case (r, rFilter) =>
+        if (l.sameResult(r)) {
+          // lFilter和rFilter的条件是OR关系
+          filterMap += (l -> Or(lFilter, rFilter))
+        }
+      }
+    }
+    logInfo(s"Fused filerMap: $filterMap")
+    filterMap
+  }
+
+  private def fusePlan(leftPlan: LogicalPlan, rightPlan: LogicalPlan,
+                       lFilterMap: Map[LogicalPlan, Expression], rFilterMap: Map[LogicalPlan, Expression]
+                      ): LogicalPlan = {
+    val fusedFilterMap = fuseFilter(lFilterMap, rFilterMap)
+    val newPlan = leftPlan.transformUpWithPruning(_.containsPattern(FILTER), UnknownRuleId) {
+      case f @ Filter(_, _) =>
+        fusedFilterMap.get(f) match {
+          case Some(newCondition) => Filter(newCondition, f.child)
+          case None => f
+        }
+    }
+    logInfo(s"Current newPlan: $newPlan")
+    newPlan
+  }
 
   /*
   :- Aggregate [count(1) AS h8_30_to_9#1L]
@@ -66,39 +101,18 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
                +- Relation spark_catalog.tpcds_2g.store[s_store_sk#110L,s_store_id#111,s_rec_start_date#112,s_rec_end_date#113,s_closed_date_sk#114L,s_store_name#115,s_number_employees#116,s_floor_space#117,s_hours#118,s_manager#119,s_market_id#120,s_geography_class#121,s_market_desc#122,s_market_manager#123,s_division_id#124,s_division_name#125,s_company_id#126,s_company_name#127,s_street_number#128,s_street_name#129,s_street_type#130,s_suite_number#131,s_city#132,s_county#133,... 5 more fields] parquet
   *
   * */
-  private def canFuse(l: LogicalPlan, r: LogicalPlan): Boolean = {
-    logInfo("Entering canFuse")
-    var lDownList: Seq[LogicalPlan] = Seq()
-    var rDownList: Seq[LogicalPlan] = Seq()
-    l.transformDown {
-      case p @ _ =>
-        p.transformExpressionsWithPruning(_.containsPattern(TreePattern.BINARY_COMPARISON),UnknownRuleId) {
-          case p @ BinaryComparison(_,_) => TrueLiteral
-        }
-        lDownList :+= p
-        p
+  private def fuseIfCan(root: LogicalPlan): LogicalPlan = {
+    val Join(leftPlan, rightPlan, _, _, _) = root
+    // 记录l和r涉及的每个表的过滤条件,leftPlan如果是引用的话会有问题
+    val lFilterMap: Map[LogicalPlan, Expression] = eliminateFilter(leftPlan)
+    val rFilterMap: Map[LogicalPlan, Expression] = eliminateFilter(rightPlan)
+    if (leftPlan.sameResult(rightPlan)) {
+      logInfo("leftPlan equals rightPlan (without filter)")
+      fusePlan(leftPlan, rightPlan, lFilterMap, rFilterMap)
+    } else {
+      logInfo("leftPlan unequals rightPlan")
+      root
     }
-    r.transformDown {
-      case p @ _ =>
-        p.transformExpressionsWithPruning(_.containsPattern(TreePattern.BINARY_COMPARISON),UnknownRuleId) {
-          case p @ BinaryComparison(_,_) => TrueLiteral
-        }
-        rDownList :+= p
-        p
-    }
-    var samePlan = true
-    logInfo(s"lDownList: $lDownList")
-    logInfo(s"rDownList: $rDownList")
-    lDownList.zip(rDownList).foreach { case (el, er) =>
-      logInfo(s"Element from seq1: $el, Element from seq2: $er")
-      if (!el.sameResult(er)) {
-        logInfo("el unequals er")
-        samePlan = false
-      } else {
-        logInfo("el equals er")
-      }
-    }
-    samePlan
   }
 
 }

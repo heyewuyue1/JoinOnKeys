@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="DataSourceManagerImpl" format="xml" multifile-model="true">
-    <data-source source="LOCAL" name="@192.168.90.173" uuid="781ab6f1-d453-4977-8d41-5baf87233a88">
+    <data-source source="LOCAL" name="tpcds_3000g@192.168.90.173" uuid="781ab6f1-d453-4977-8d41-5baf87233a88">
       <driver-ref>spark</driver-ref>
       <synchronize>true</synchronize>
       <jdbc-driver>org.apache.hive.jdbc.HiveDriver</jdbc-driver>
-      <jdbc-url>jdbc:hive2://192.168.90.173:10000</jdbc-url>
+      <jdbc-url>jdbc:hive2://192.168.90.173:10000/tpcds_3000g</jdbc-url>
       <jdbc-additional-properties>
         <property name="com.intellij.clouds.kubernetes.db.host.port" />
         <property name="com.intellij.clouds.kubernetes.db.enabled" value="false" />
