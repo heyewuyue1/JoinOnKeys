@@ -5,15 +5,21 @@ import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.{Rule, UnknownRuleId}
 import org.apache.spark.sql.catalyst.trees.TreePattern.{FILTER, JOIN}
 import org.apache.spark.sql.catalyst.plans.logical._
-import org.apache.spark.sql.catalyst.expressions.{Expression, Or}
+import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.types.StringType
 
 object JoinOnKeys extends Rule[LogicalPlan] with Logging{
+
+  // 合成布尔索引列的ID，因为新合成的列需要有一个名字
+  private var curNamedExpressionID: Int = 0
+
+  // 对所有Join节点的左右子节点判断fuseIfCan
   override def apply(plan: LogicalPlan): LogicalPlan = {
     plan.transformDownWithPruning(_.containsPattern(JOIN), UnknownRuleId) {
       case j @ Join(l: LogicalPlan, r: LogicalPlan, _, _, _) =>
         logInfo("Join detected")
         logInfo(s"Left plan: ${l.toString()}")
-        logInfo(s"Right plan: ${l.toString()}")
+        logInfo(s"Right plan: ${r.toString()}")
         fuseIfCan(j)
     }
   }
@@ -28,7 +34,6 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
     }
     filterMap
   }
-
 
   // 合并两个在同一个子计划上进行的过滤条件
   private def fuseFilter(lFilterMap: Map[LogicalPlan, Expression], rFilterMap: Map[LogicalPlan, Expression]): Map[LogicalPlan, Expression] = {
@@ -45,18 +50,51 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
     filterMap
   }
 
+  // 合成布尔索引列
+  private def makeBoolIndex(filterMap: Map[LogicalPlan, Expression]) :NamedExpression = {
+
+    //null的真值是false，但实际上什么都没有应该是true
+    var boolIndexExp: Expression = Literal(null, StringType)
+    filterMap.foreach{case (subPlan: LogicalPlan, filter: Expression) =>
+      if (boolIndexExp.semanticEquals(Literal(null, StringType))) {
+        boolIndexExp = filter
+      } else {
+        boolIndexExp = And(filter, boolIndexExp)
+      }
+    }
+    logInfo(s"NamedExpression$curNamedExpressionID: $boolIndexExp")
+    val namedBoolIndexExp: NamedExpression = Alias(boolIndexExp, s"NamedExpression$curNamedExpressionID")()
+    curNamedExpressionID += 1
+    namedBoolIndexExp
+  }
+
+  // 融合leftPlan和rightPlan
   private def fusePlan(leftPlan: LogicalPlan, rightPlan: LogicalPlan,
                        lFilterMap: Map[LogicalPlan, Expression], rFilterMap: Map[LogicalPlan, Expression]
                       ): LogicalPlan = {
     val fusedFilterMap = fuseFilter(lFilterMap, rFilterMap)
-    val newPlan = leftPlan.transformUpWithPruning(_.containsPattern(FILTER), UnknownRuleId) {
+
+    // 逻辑有问题
+    var newPlan = leftPlan.transformUpWithPruning(_.containsPattern(FILTER), UnknownRuleId) {
       case f @ Filter(_, _) =>
         fusedFilterMap.get(f) match {
           case Some(newCondition) => Filter(newCondition, f.child)
           case None => f
         }
     }
+
+    // 构建布尔索引
+    val leftBoolIndex = makeBoolIndex(lFilterMap)
+    val rightBoolIndex = makeBoolIndex(rFilterMap)
+
+    // 在newPlan上Project出leftPlan和rightPlan的所有列以及布尔索引，这个地方plan.output和boolIndex的类型可能有问题
+    newPlan = Project(leftPlan.output ++ rightPlan.output ++ leftBoolIndex ++ rightBoolIndex, newPlan)
+
     logInfo(s"Current newPlan: $newPlan")
+
+    // 要再继续析出left和right本来的列
+
+
     newPlan
   }
 
@@ -101,6 +139,8 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
                +- Relation spark_catalog.tpcds_2g.store[s_store_sk#110L,s_store_id#111,s_rec_start_date#112,s_rec_end_date#113,s_closed_date_sk#114L,s_store_name#115,s_number_employees#116,s_floor_space#117,s_hours#118,s_manager#119,s_market_id#120,s_geography_class#121,s_market_desc#122,s_market_manager#123,s_division_id#124,s_division_name#125,s_company_id#126,s_company_name#127,s_street_number#128,s_street_name#129,s_street_type#130,s_suite_number#131,s_city#132,s_county#133,... 5 more fields] parquet
   *
   * */
+
+  // 如果可以融合则融合root的左右节点
   private def fuseIfCan(root: LogicalPlan): LogicalPlan = {
     val Join(leftPlan, rightPlan, _, _, _) = root
     // 记录l和r涉及的每个表的过滤条件,leftPlan如果是引用的话会有问题
