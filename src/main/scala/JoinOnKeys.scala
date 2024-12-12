@@ -18,21 +18,21 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
     plan.transformDownWithPruning(_.containsPattern(JOIN), UnknownRuleId) {
       case j @ Join(l: LogicalPlan, r: LogicalPlan, _, _, _) =>
         logInfo("Join detected")
-        logInfo(s"Left plan: ${l.toString()}")
-        logInfo(s"Right plan: ${r.toString()}")
+        //logInfo(s"Left plan: ${l.toString()}")
+        //logInfo(s"Right plan: ${r.toString()}")
         fuseIfCan(j)
     }
   }
 
   // 从逻辑计划中提取出所有的过滤条件
-  private def eliminateFilter(p: LogicalPlan): Map[LogicalPlan, Expression] = {
+  private def eliminateFilter(p: LogicalPlan):  (LogicalPlan, Map[LogicalPlan, Expression]) = {
     var filterMap: Map[LogicalPlan, Expression]= Map()
-    p.transformUpWithPruning(_.containsPattern(FILTER), UnknownRuleId) {
+    val newPlan = p.transformUpWithPruning(_.containsPattern(FILTER), UnknownRuleId) {
       case f @ Filter(condition, child) =>
         filterMap += (child -> condition)
         child
     }
-    filterMap
+    (newPlan, filterMap)
   }
 
   // 合并两个在同一个子计划上进行的过滤条件
@@ -54,7 +54,7 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
   private def makeBoolIndex(filterMap: Map[LogicalPlan, Expression]) :NamedExpression = {
 
     //null的真值是false，但实际上什么都没有应该是true
-    var boolIndexExp: Expression = Literal(null, StringType)
+    var boolIndexExp: Expression = Literal(null, StringType)  //  = null
     filterMap.foreach{case (subPlan: LogicalPlan, filter: Expression) =>
       if (boolIndexExp.semanticEquals(Literal(null, StringType))) {
         boolIndexExp = filter
@@ -73,29 +73,32 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
                        lFilterMap: Map[LogicalPlan, Expression], rFilterMap: Map[LogicalPlan, Expression]
                       ): LogicalPlan = {
     val fusedFilterMap = fuseFilter(lFilterMap, rFilterMap)
+    logInfo(s"fusedFMap:${fusedFilterMap}")
 
-    // 逻辑有问题
-    var newPlan = leftPlan.transformUpWithPruning(_.containsPattern(FILTER), UnknownRuleId) {
+    // 逻辑有问题  ?
+    var newPlan = leftPlan.transformDownWithPruning(_.containsPattern(FILTER), UnknownRuleId) {
       case f @ Filter(_, _) =>
-        fusedFilterMap.get(f) match {
+        fusedFilterMap.get(f.child) match {
           case Some(newCondition) => Filter(newCondition, f.child)
           case None => f
         }
     }
+    logInfo(s"newPlan:${newPlan}")
 
     // 构建布尔索引
     val leftBoolIndex = makeBoolIndex(lFilterMap)
     val rightBoolIndex = makeBoolIndex(rFilterMap)
 
     // 在newPlan上Project出leftPlan和rightPlan的所有列以及布尔索引，这个地方plan.output和boolIndex的类型可能有问题
-    newPlan = Project(leftPlan.output ++ rightPlan.output ++ leftBoolIndex ++ rightBoolIndex, newPlan)
-
-    logInfo(s"Current newPlan: $newPlan")
-
+    newPlan = Project(leftPlan.output ++ rightPlan.output :+ leftBoolIndex :+ rightBoolIndex, newPlan)
+    logInfo(s"Current newPlan: ${newPlan}")
+    /*
     // 要再继续析出left和right本来的列
+    */
 
 
-    newPlan
+
+    leftPlan
   }
 
   /*
@@ -143,16 +146,23 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
   // 如果可以融合则融合root的左右节点
   private def fuseIfCan(root: LogicalPlan): LogicalPlan = {
     val Join(leftPlan, rightPlan, _, _, _) = root
+    logInfo(s"leftP:${leftPlan}, \n rightP:${rightPlan}")
     // 记录l和r涉及的每个表的过滤条件,leftPlan如果是引用的话会有问题
-    val lFilterMap: Map[LogicalPlan, Expression] = eliminateFilter(leftPlan)
-    val rFilterMap: Map[LogicalPlan, Expression] = eliminateFilter(rightPlan)
-    if (leftPlan.sameResult(rightPlan)) {
+    val (leftP_After, lFilterMap) = eliminateFilter(leftPlan)
+    val (rightP_After, rFilterMap) = eliminateFilter(rightPlan)
+    logInfo(s"lFilterMap: ${lFilterMap}, \n rFilterMap:${rFilterMap}")
+    logInfo(s"leftP_After:${leftP_After}, \n rightP:${rightP_After}")
+
+    if (leftP_After.sameResult(rightP_After)) {
       logInfo("leftPlan equals rightPlan (without filter)")
       fusePlan(leftPlan, rightPlan, lFilterMap, rFilterMap)
     } else {
       logInfo("leftPlan unequals rightPlan")
+      logInfo(s"leftP:${leftPlan}")
       root
     }
+
+    root
   }
 
 }
