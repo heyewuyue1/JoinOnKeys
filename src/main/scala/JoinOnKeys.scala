@@ -3,11 +3,11 @@ package cn.edu.ruc
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.{Rule, UnknownRuleId}
-import org.apache.spark.sql.catalyst.trees.TreePattern.{FILTER, JOIN}
+import org.apache.spark.sql.catalyst.trees.TreePattern.{FILTER, JOIN, PROJECT}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
-import org.apache.spark.sql.catalyst.optimizer.{SimplifyConditionals, BooleanSimplification, ConstantFolding, NullPropagation}
+import org.apache.spark.sql.catalyst.optimizer.{BooleanSimplification, ConstantFolding, NullPropagation, SimplifyConditionals}
 import org.apache.spark.sql.types.StringType
 
 object JoinOnKeys extends Rule[LogicalPlan] with Logging{
@@ -114,8 +114,8 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
   }
 
   // 合成布尔索引列
-  private def makeBoolIndex(filterMap: Map[LogicalPlan, Expression]) :NamedExpression = {
-
+  private def makeBoolIndex(filterMap: Map[LogicalPlan, Expression]) :(NamedExpression,ExprId, Set[AttributeReference])  = {
+    var columnsSet: Set[AttributeReference] = Set()
     //null的真值是false，但实际上什么都没有应该是true
     var boolIndexExp: Expression = Literal(null, StringType)  //  = null
     filterMap.foreach{case (subPlan: LogicalPlan, filter: Expression) =>
@@ -124,22 +124,38 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
       } else {
         boolIndexExp = And(filter, boolIndexExp)
       }
+      columnsSet ++= extractColumns(filter)
     }
 //    logInfo(s"NamedExpression$curNamedExpressionID: $boolIndexExp")
     val namedBoolIndexExp: NamedExpression = Alias(boolIndexExp, s"NamedExpression$curNamedExpressionID")()
     curNamedExpressionID += 1
-    namedBoolIndexExp
+    (namedBoolIndexExp,namedBoolIndexExp.exprId, columnsSet)
   }
 
-  private def insertFilterIntoAggregate(agg: Seq[NamedExpression], filter: NamedExpression): Seq[NamedExpression] = {
+  private def insertFilterIntoAggregate(agg: Seq[NamedExpression], filter: NamedExpression, exprid: ExprId): Seq[NamedExpression] = {
     agg.map {
       case Alias(aggExpr: AggregateExpression, name) =>
         Alias(
-          aggExpr.copy(filter = Some(AttributeReference(filter.name, filter.dataType)())), // 更新 AggregateExpression 的 filter
+          aggExpr.copy(filter = Some(AttributeReference(filter.name, filter.dataType)(exprId = exprid))), // 更新 AggregateExpression 的 filter，保留exprid
           name
         )()
       case other =>
         other // 保留其他 NamedExpression 不变
+    }
+  }
+
+  private def extractColumns(expression: Expression): Set[AttributeReference] = {
+    expression match {
+      case attr: AttributeReference => Set(attr) // If it's an AttributeReference, return it as a set
+      case andExpr: And =>
+        extractColumns(andExpr.left) ++ extractColumns(andExpr.right)
+      case orExpr: Or =>
+        extractColumns(orExpr.left) ++ extractColumns(orExpr.right)
+      case equalExpr: EqualTo =>
+        extractColumns(equalExpr.left) ++ extractColumns(equalExpr.right)
+      case _ =>
+        // For any other expression types, recursively extract from children (if they exist)
+        expression.children.flatMap(extractColumns).toSet
     }
   }
 
@@ -159,20 +175,47 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
         }
     }
 
-    // 构建布尔索引
-    val leftBoolIndex = makeBoolIndex(lFilterMap)
-    val rightBoolIndex = makeBoolIndex(rFilterMap)
-    // 在newPlan上Project出leftPlan和rightPlan的所有列以及布尔索引，output有问题
+    // 构建布尔索引 并记录其ExprID、其中filter涉及的列的集合
+    val (leftBoolIndex,leftBoolIndex_ExprID,left_cols) = makeBoolIndex(lFilterMap)
+    val (rightBoolIndex,rightBoolIndex_ExprID, right_cols) = makeBoolIndex(rFilterMap)
+    val combinedSet = left_cols ++ right_cols   // combinedSet即必须传递到最上层project的所有列
+
+    //为每个project的output添加后续需要的列
+    newPlan = newPlan.transformUpWithPruning(_.containsPattern(PROJECT), UnknownRuleId) {
+      case project @ Project(projectList, child) =>
+        val inputcols = child.output
+        val outputcols = project.output
+        val inputColsAsRef = inputcols.collect { case attr: AttributeReference => attr }.toSet  // 类型转换
+        val outputColsAsRef = outputcols.collect { case attr: AttributeReference => attr }.toSet
+        //logInfo(s"inputColsAsRef:$inputColsAsRef, outputColsAsRef:$outputColsAsRef")
+        val missingColumns = inputColsAsRef.diff(outputColsAsRef) // IN  inputCols,  NOTIN outputColumns
+        //logInfo(s"missingColumns:$missingColumns")
+        val intersectingColumns = missingColumns.filter(missingAttr => // 找交集，比较内容而非引用
+          combinedSet.exists(combinedAttr =>
+            missingAttr.name == combinedAttr.name && missingAttr.dataType == combinedAttr.dataType
+          )
+        )
+        //logInfo(s"intersectingColumns:$intersectingColumns")
+        if (intersectingColumns.nonEmpty) {
+          val newProjectList = projectList ++ intersectingColumns
+          val newProject = project.copy(projectList = newProjectList)
+          newProject
+        } else {
+          project
+        }
+        }
+
+    // 在newPlan上Project出leftPlan和rightPlan的所有列以及布尔索引
     newPlan = Project(Seq(leftBoolIndex, rightBoolIndex), newPlan.children.head.children.head)
 
     var Aggregate(lGroupExpr, lAggExpr, _) = leftPlan
     var Aggregate(_, rAggExpr, _) = rightPlan
 
-    lAggExpr = insertFilterIntoAggregate(lAggExpr, leftBoolIndex)
-    rAggExpr = insertFilterIntoAggregate(rAggExpr, rightBoolIndex)
+    // agg中的 filter(where NamedExpression0#ExprId) 中的ExprId应该和projet中相应的值相同
+    lAggExpr = insertFilterIntoAggregate(lAggExpr, leftBoolIndex, leftBoolIndex_ExprID)
+    rAggExpr = insertFilterIntoAggregate(rAggExpr, rightBoolIndex, rightBoolIndex_ExprID)
 
     newPlan = Aggregate(lGroupExpr, lAggExpr ++ rAggExpr, newPlan)
-
     newPlan
   }
 
