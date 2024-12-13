@@ -52,16 +52,49 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
     (newPlan, filterMap)
   }
 
-  // 递归修改表达式中的 exprId，使其与 target 的 exprId 保持一致
-  private def replaceExprId(rFilter: Expression, lFilter: Expression): Expression = {
-    // 找到 rFilter 中的每个叶子节点，并将 exprId 替换为 lFilter 的 exprId
-    rFilter.transform {
+  private def replaceExprId(lFilter: Expression, rFilter: Expression): Expression = {
+    logInfo("Start to replaceExprId")
+    // 收集 lFilter 中所有 AttributeReference 信息
+    val lAttributes = lFilter.collect {
+      case attr: AttributeReference => attr
+    }.map(attr => (attr.name, attr.dataType) -> attr).toMap
+
+    logInfo(s"lAttributes: $lAttributes")
+
+    logInfo(s"Before rFilter: $rFilter")
+    // 替换 rFilter 中的 AttributeReference
+    val newRFilter = rFilter.transform {
       case attr: AttributeReference =>
-        // 复制 attr，并使用 lFilter 中对应的 exprId
-        val newExprId = lFilter.collectFirst {
-          case a: AttributeReference if a.semanticEquals(attr) => a.exprId
-        }.getOrElse(attr.exprId)
-        attr.withExprId(newExprId)
+        // 如果在 lAttributes 中找到相同名称和类型的 Attribute，则替换为 lFilter 中的引用
+        lAttributes.get((attr.name, attr.dataType)).getOrElse(attr)
+    }
+    logInfo(s"After rFilter: $newRFilter")
+
+    newRFilter
+  }
+
+  // 递归修改表达式中的 exprId，使其与 target 的 exprId 保持一致
+  private def replaceFilterMapExprId(
+                             lFilterMap: Map[LogicalPlan, Expression],
+                             rFilterMap: Map[LogicalPlan, Expression]
+                           ): Map[LogicalPlan, Expression] = {
+    rFilterMap.map { case (rLogicalPlan, rFilter) =>
+      logInfo(s"Finding corresponding lFilter for rFilter: $rFilter")
+      // 在 lFilterMap 中找到与 rLogicalPlan 等价的 lLogicalPlan
+      val lFilterOpt = lFilterMap.collectFirst {
+        case (lLogicalPlan, lFilter) if lLogicalPlan.sameResult(rLogicalPlan) =>
+          logInfo(s"Collected corresponding lFilter: $lFilter")
+          lFilter
+      }
+
+      // 如果存在 lFilter，则替换 rFilter 中的 AttributeReference
+      val updatedRFilter = lFilterOpt match {
+        case Some(lFilter) => replaceExprId(lFilter, rFilter) // 调用之前实现的替换函数
+        case None => rFilter // 如果 lFilter 不存在，则保持 rFilter 不变
+      }
+
+      // 返回更新后的 (LogicalPlan, Expression) 对
+      rLogicalPlan -> updatedRFilter
     }
   }
 
@@ -72,7 +105,7 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
       rFilterMap.foreach { case (r, rFilter) =>
         if (l.sameResult(r)) {
           // lFilter和rFilter的条件是OR关系
-          filterMap += (l -> Or(lFilter, replaceExprId(lFilter,rFilter)))
+          filterMap += (l -> Or(lFilter, rFilter))
         }
       }
     }
@@ -116,7 +149,7 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
                       ): LogicalPlan = {
 
     val fusedFilterMap = fuseFilter(lFilterMap, rFilterMap)
-    logInfo(s"fusedFMap:${fusedFilterMap}")
+    logInfo(s"fusedFilterMap:${fusedFilterMap}")
 
     var newPlan = leftPlan.transformDownWithPruning(_.containsPattern(FILTER), UnknownRuleId) {
       case f @ Filter(_, _) =>
@@ -155,13 +188,7 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
       logInfo("leftPlan equals rightPlan (without filter)")
 
       // 对rFilterMap中的每个过滤条件，将其替换为与lFilterMap中对应的过滤条件exprID相等
-      rFilterMap.foreach{ case (r, rFilter) =>
-        lFilterMap.foreach({ case (l, lFilter) =>
-          if (r.sameResult(l)) {
-            rFilterMap += (r -> replaceExprId(rFilter, lFilter))
-          }
-        })
-      }
+      rFilterMap = replaceFilterMapExprId(lFilterMap, rFilterMap)
       fusePlan(leftPlan, rightPlan, lFilterMap, rFilterMap)
     } else {
       logInfo("leftPlan unequals rightPlan")
