@@ -10,11 +10,15 @@ import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.optimizer.{BooleanSimplification, ConstantFolding, NullPropagation, SimplifyConditionals}
 import org.apache.spark.sql.types.StringType
 
+import scala.collection.mutable
+
 object JoinOnKeys extends Rule[LogicalPlan] with Logging{
 
   // 合成布尔索引列的ID，因为新合成的列需要有一个名字
   private var curNamedExpressionID: Int = 0
-//  private var indexPlan: Seq[LogicalPlan] = Seq()
+  private var PlanTemplate:Option[LogicalPlan] = None
+  private var FilterMap:mutable.Map[Int,(NamedExpression, Char)] = mutable.Map()
+  //  private var indexPlan: Seq[LogicalPlan] = Seq()
 
   // 辅助方法：对 LogicalPlan 进行表达式简化
   private def simplifyLogicalPlan(plan: LogicalPlan): LogicalPlan = {
@@ -33,9 +37,10 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
   override def apply(plan: LogicalPlan): LogicalPlan = {
     var newPlan = plan.transformDownWithPruning(_.containsPattern(JOIN), UnknownRuleId) {
       case j @ Join(l: LogicalPlan, r: LogicalPlan, _, _, _) =>
-        logInfo("Join detected")
-        fuseIfCan(j)
+        logInfo(s"Join detected with type: ${j.joinType}")
+          fuseIfCan(j)
     }
+    logInfo(s"FilterMap:$FilterMap")
     newPlan = simplifyLogicalPlan(newPlan)
     logInfo(s"newPlan: ${newPlan.toString()}")
     newPlan
@@ -53,22 +58,22 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
   }
 
   private def replaceExprId(lFilter: Expression, rFilter: Expression): Expression = {
-    logInfo("Start to replaceExprId")
+    //logInfo("Start to replaceExprId")
     // 收集 lFilter 中所有 AttributeReference 信息
     val lAttributes = lFilter.collect {
       case attr: AttributeReference => attr
     }.map(attr => (attr.name, attr.dataType) -> attr).toMap
 
-    logInfo(s"lAttributes: $lAttributes")
+    //logInfo(s"lAttributes: $lAttributes")
 
-    logInfo(s"Before rFilter: $rFilter")
+    //logInfo(s"Before rFilter: $rFilter")
     // 替换 rFilter 中的 AttributeReference
     val newRFilter = rFilter.transform {
       case attr: AttributeReference =>
         // 如果在 lAttributes 中找到相同名称和类型的 Attribute，则替换为 lFilter 中的引用
         lAttributes.get((attr.name, attr.dataType)).getOrElse(attr)
     }
-    logInfo(s"After rFilter: $newRFilter")
+    //logInfo(s"After rFilter: $newRFilter")
 
     newRFilter
   }
@@ -109,12 +114,11 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
         }
       }
     }
-//    logInfo(s"Fused filerMap: $filterMap")
     filterMap
   }
 
   // 合成布尔索引列
-  private def makeBoolIndex(filterMap: Map[LogicalPlan, Expression]) :(NamedExpression,ExprId, Set[AttributeReference])  = {
+  private def makeBoolIndex(filterMap: Map[LogicalPlan, Expression],LorR: Char) :(NamedExpression,ExprId, Set[AttributeReference])  = {
     var columnsSet: Set[AttributeReference] = Set()
     //null的真值是false，但实际上什么都没有应该是true
     var boolIndexExp: Expression = Literal(null, StringType)  //  = null
@@ -128,6 +132,7 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
     }
 //    logInfo(s"NamedExpression$curNamedExpressionID: $boolIndexExp")
     val namedBoolIndexExp: NamedExpression = Alias(boolIndexExp, s"NamedExpression$curNamedExpressionID")()
+    FilterMap += (curNamedExpressionID -> (namedBoolIndexExp,LorR))
     curNamedExpressionID += 1
     (namedBoolIndexExp,namedBoolIndexExp.exprId, columnsSet)
   }
@@ -141,6 +146,16 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
         )()
       case other =>
         other // 保留其他 NamedExpression 不变
+    }
+  }
+
+  private def insertFilterIntoAggregateLeft(aggs: Seq[NamedExpression], filters: Seq[NamedExpression]): Seq[NamedExpression] = {
+    aggs.zip(filters).map {
+      case (Alias(aggExpr: AggregateExpression, name),filter) =>
+        Alias(
+          aggExpr.copy(filter = Some(AttributeReference(filter.name, filter.dataType)(exprId = filter.exprId))), // 更新 AggregateExpression 的 filter，保留exprid
+          name
+        )()
     }
   }
 
@@ -161,12 +176,11 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
 
   // 融合leftPlan和rightPlan
   private def fusePlan(leftPlan: LogicalPlan, rightPlan: LogicalPlan,
-                       lFilterMap: Map[LogicalPlan, Expression], rFilterMap: Map[LogicalPlan, Expression]
+                       lFilterMap: Map[LogicalPlan, Expression], rFilterMap: Map[LogicalPlan, Expression],
+                       isM: Boolean
                       ): LogicalPlan = {
-
     val fusedFilterMap = fuseFilter(lFilterMap, rFilterMap)
     logInfo(s"fusedFilterMap:${fusedFilterMap}")
-
     var newPlan = leftPlan.transformDownWithPruning(_.containsPattern(FILTER), UnknownRuleId) {
       case f @ Filter(_, _) =>
         fusedFilterMap.get(f.child) match {
@@ -176,8 +190,10 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
     }
 
     // 构建布尔索引 并记录其ExprID、其中filter涉及的列的集合
-    val (leftBoolIndex,leftBoolIndex_ExprID,left_cols) = makeBoolIndex(lFilterMap)
-    val (rightBoolIndex,rightBoolIndex_ExprID, right_cols) = makeBoolIndex(rFilterMap)
+    logInfo(s"lFilterMap: $lFilterMap")
+    val (leftBoolIndex, leftBoolIndex_ExprID, left_cols) =
+      if (isM) makeBoolIndex(lFilterMap, 'l') else makeBoolIndex(lFilterMap, 'r') // 如果是第一次JOK，则把left和right都记为r。
+    val (rightBoolIndex,rightBoolIndex_ExprID, right_cols) = makeBoolIndex(rFilterMap,'r')  //标记为r的是每个子查询对应的NamedExpression
     val combinedSet = left_cols ++ right_cols   // combinedSet即必须传递到最上层project的所有列
 
     //为每个project的output添加后续需要的列
@@ -204,17 +220,27 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
           project
         }
         }
-
+    FilterMap.foreach { case (key, value) =>
+      logInfo(s"FilterMap  Key: $key, Value: $value")
+    }
+    val NExpressions: Seq[NamedExpression] = FilterMap.toSeq  // left部分所有的NamedExpression
+      .sortBy(_._1)    // 按 key (Int) 递增排序
+      .collect { case (_, (expr, 'r')) => expr }  // 筛选 Char == 'r'，提取 NamedExpression
+      .dropRight(1) // 丢掉最后一个（最后一个是right的）
     // 在newPlan上Project出leftPlan和rightPlan的所有列以及布尔索引
-    newPlan = Project(Seq(leftBoolIndex, rightBoolIndex), newPlan.children.head.children.head)
+    newPlan = Project(NExpressions:+rightBoolIndex, newPlan.children.head.children.head)
 
     var Aggregate(lGroupExpr, lAggExpr, _) = leftPlan
     var Aggregate(_, rAggExpr, _) = rightPlan
 
     // agg中的 filter(where NamedExpression0#ExprId) 中的ExprId应该和projet中相应的值相同
-    lAggExpr = insertFilterIntoAggregate(lAggExpr, leftBoolIndex, leftBoolIndex_ExprID)
+    logInfo(s"NExpressions:$NExpressions")
+    lAggExpr = insertFilterIntoAggregateLeft(lAggExpr, NExpressions)
+    logInfo(s"lAggExpr:$lAggExpr")
     rAggExpr = insertFilterIntoAggregate(rAggExpr, rightBoolIndex, rightBoolIndex_ExprID)
 
+    logInfo(s"length: left=${lAggExpr.length}, right=${rAggExpr.length}")
+    logInfo(s"Agg: left=${lAggExpr}, right=${rAggExpr}")
     newPlan = Aggregate(lGroupExpr, lAggExpr ++ rAggExpr, newPlan)
     newPlan
   }
@@ -226,15 +252,29 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
     // 记录l和r涉及的每个表的过滤条件
     var (leftP_After, lFilterMap) = eliminateFilter(leftPlan)
     var (rightP_After, rFilterMap) = eliminateFilter(rightPlan)
-
+    var isM = false
     if (leftP_After.sameResult(rightP_After)) {
       logInfo("leftPlan equals rightPlan (without filter)")
-
+      logInfo(s"leftPlan:$leftPlan")
       // 对rFilterMap中的每个过滤条件，将其替换为与lFilterMap中对应的过滤条件exprID相等
       rFilterMap = replaceFilterMapExprId(lFilterMap, rFilterMap)
-      fusePlan(leftPlan, rightPlan, lFilterMap, rFilterMap)
+
+      if (PlanTemplate.isEmpty)
+        PlanTemplate = Some(leftP_After)
+
+      fusePlan(leftPlan, rightPlan, lFilterMap, rFilterMap, isM)
     } else {
       logInfo("leftPlan unequals rightPlan")
+
+      if (PlanTemplate.isDefined && rightP_After.sameResult(PlanTemplate.get) && leftPlan.isInstanceOf[Aggregate]) {
+        isM = true
+        logInfo("rightPlan equals Template (without filter)")
+        logInfo(s"leftPlan:${leftPlan}, rightPlan:${rightPlan}")
+        rFilterMap = replaceFilterMapExprId(lFilterMap, rFilterMap)
+        val new2Plan = fusePlan(leftPlan, rightPlan, lFilterMap, rFilterMap, isM)
+        logInfo(s"new2Plan:${new2Plan}")
+        return new2Plan
+      }
       root
     }
   }
