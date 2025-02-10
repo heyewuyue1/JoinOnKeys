@@ -18,7 +18,6 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
   private var curNamedExpressionID: Int = 0
   private var PlanTemplate:Option[LogicalPlan] = None
   private var FilterMap:mutable.Map[Int,(NamedExpression, Char)] = mutable.Map()
-  //  private var indexPlan: Seq[LogicalPlan] = Seq()
 
   // 辅助方法：对 LogicalPlan 进行表达式简化
   private def simplifyLogicalPlan(plan: LogicalPlan): LogicalPlan = {
@@ -40,7 +39,6 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
         logInfo(s"Join detected with type: ${j.joinType}")
           fuseIfCan(j)
     }
-    logInfo(s"FilterMap:$FilterMap")
     newPlan = simplifyLogicalPlan(newPlan)
     logInfo(s"newPlan: ${newPlan.toString()}")
     newPlan
@@ -190,10 +188,18 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
     }
 
     // 构建布尔索引 并记录其ExprID、其中filter涉及的列的集合
-    logInfo(s"lFilterMap: $lFilterMap")
+    var Aggregate(lGroupExpr, lAggExpr, _) = leftPlan
+    var Aggregate(_, rAggExpr, _) = rightPlan
     val (leftBoolIndex, leftBoolIndex_ExprID, left_cols) =
       if (isM) makeBoolIndex(lFilterMap, 'l') else makeBoolIndex(lFilterMap, 'r') // 如果是第一次JOK，则把left和right都记为r。
+    val NExpressions: Seq[NamedExpression] = FilterMap.toSeq  // left部分所有的NamedExpression
+      .sortBy(_._1)    // 按 key (Int) 递增排序
+      .collect { case (_, (expr, 'r')) => expr }  // 筛选 Char == 'r'，提取 NamedExpression
+      .takeRight(lAggExpr.length)  // 取最后lAggExpr.length个
     val (rightBoolIndex,rightBoolIndex_ExprID, right_cols) = makeBoolIndex(rFilterMap,'r')  //标记为r的是每个子查询对应的NamedExpression
+    FilterMap.foreach { case (key, value) =>
+      logInfo(s"FilterMap  Key: $key, Value: $value")
+    }
     val combinedSet = left_cols ++ right_cols   // combinedSet即必须传递到最上层project的所有列
 
     //为每个project的output添加后续需要的列
@@ -220,18 +226,8 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
           project
         }
         }
-    FilterMap.foreach { case (key, value) =>
-      logInfo(s"FilterMap  Key: $key, Value: $value")
-    }
-    val NExpressions: Seq[NamedExpression] = FilterMap.toSeq  // left部分所有的NamedExpression
-      .sortBy(_._1)    // 按 key (Int) 递增排序
-      .collect { case (_, (expr, 'r')) => expr }  // 筛选 Char == 'r'，提取 NamedExpression
-      .dropRight(1) // 丢掉最后一个（最后一个是right的）
     // 在newPlan上Project出leftPlan和rightPlan的所有列以及布尔索引
     newPlan = Project(NExpressions:+rightBoolIndex, newPlan.children.head.children.head)
-
-    var Aggregate(lGroupExpr, lAggExpr, _) = leftPlan
-    var Aggregate(_, rAggExpr, _) = rightPlan
 
     // agg中的 filter(where NamedExpression0#ExprId) 中的ExprId应该和projet中相应的值相同
     logInfo(s"NExpressions:$NExpressions")
