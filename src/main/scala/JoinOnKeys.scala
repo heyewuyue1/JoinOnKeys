@@ -6,7 +6,7 @@ import org.apache.spark.sql.catalyst.rules.{Rule, UnknownRuleId}
 import org.apache.spark.sql.catalyst.trees.TreePattern.{FILTER, JOIN, PROJECT}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
+import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, AggregateFunction}
 import org.apache.spark.sql.catalyst.optimizer.{BooleanSimplification, ConstantFolding, NullPropagation, SimplifyConditionals}
 import org.apache.spark.sql.types.StringType
 
@@ -41,6 +41,7 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
     }
     newPlan = simplifyLogicalPlan(newPlan)
     logInfo(s"newPlan: ${newPlan.toString()}")
+    logInfo(s"lenFilterMap:${FilterMap.size}")
     newPlan
   }
 
@@ -147,14 +148,19 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
     }
   }
 
-  private def insertFilterIntoAggregateLeft(aggs: Seq[NamedExpression], filters: Seq[NamedExpression]): Seq[NamedExpression] = {
-    aggs.zip(filters).map {
-      case (Alias(aggExpr: AggregateExpression, name),filter) =>
-        Alias(
-          aggExpr.copy(filter = Some(AttributeReference(filter.name, filter.dataType)(exprId = filter.exprId))), // 更新 AggregateExpression 的 filter，保留exprid
-          name
-        )()
-    }
+  private def insertFilterIntoAggregateLL(len:Int, aggs: Seq[NamedExpression], filters: Seq[NamedExpression]): Seq[NamedExpression] = {
+    val filterIter = filters.iterator // 创建迭代器
+    aggs.grouped(len).flatMap { aggGroup =>
+      val filter = filterIter.next() // 取下一个 filter，不足时用最后一个 filter
+      aggGroup.map {
+        case Alias(aggExpr: AggregateExpression, name) =>
+          Alias(
+            aggExpr.copy(filter = Some(AttributeReference(filter.name, filter.dataType)(exprId = filter.exprId))),
+            name
+          )()
+        case otherAgg => otherAgg // 非 AggregateExpression 直接返回
+      }
+    }.toSeq
   }
 
   private def extractColumns(expression: Expression): Set[AttributeReference] = {
@@ -169,6 +175,47 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
       case _ =>
         // For any other expression types, recursively extract from children (if they exist)
         expression.children.flatMap(extractColumns).toSet
+    }
+  }
+
+  private def extractColumnsFromAggExpressions(aggs: Seq[NamedExpression]): Seq[AttributeReference] = {
+    aggs.flatMap {
+      case Alias(child, _) => extractColumns2(child) // 解析 Alias
+      case other => extractColumns2(other) // 直接解析
+    }.distinct // 去重
+  }
+
+  private def extractColumns2(expr: Expression): Seq[AttributeReference] = {
+    expr match {
+      case agg: AggregateExpression => extractColumns2(agg.aggregateFunction) // 解析 AggregateExpression
+      case func: AggregateFunction => func.children.collect { case attr: AttributeReference => attr } // 提取 AttributeReference
+      case _ => Seq.empty
+    }
+  }
+  private def extractAliasesFromAggExpressions(aggs: Seq[NamedExpression]): Seq[String] = {
+    aggs.collect {
+      case Alias(_, aliasName) => aliasName // 提取 Alias 中的别名
+    }
+  }
+
+  private def replaceAliases(lAggExpr: Seq[NamedExpression], ralias: Seq[String]): Seq[NamedExpression] = {
+    lAggExpr.zip(ralias).map {
+      case (Alias(aggExpr, name),newalias) =>
+        Alias(aggExpr,newalias)()// 返回 NamedExpression
+    }
+  }
+
+  private def replaceAttrRefInAggExpressions(attrs: Seq[AttributeReference], rAggExprs: Seq[NamedExpression]): Seq[NamedExpression] = {
+    val lAttributes = attrs.map(attr => attr.name -> attr).toMap
+    // 替换 rAggExpr 中的 AttributeReference
+    rAggExprs.map{
+      case Alias(rAggExpr, aliasName) =>
+        Alias(
+        rAggExpr.transform {
+          case attr: AttributeReference =>
+            // 如果在 lAttributes 中找到相同名称和类型的 Attribute，则替换为 lFilter 中的引用
+            lAttributes.get(attr.name).getOrElse(attr)
+        }, aliasName)()
     }
   }
 
@@ -195,7 +242,7 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
     val NExpressions: Seq[NamedExpression] = FilterMap.toSeq  // left部分所有的NamedExpression
       .sortBy(_._1)    // 按 key (Int) 递增排序
       .collect { case (_, (expr, 'r')) => expr }  // 筛选 Char == 'r'，提取 NamedExpression
-      .takeRight(lAggExpr.length)  // 取最后lAggExpr.length个
+      .takeRight(lAggExpr.length/rAggExpr.length)  // 取最后(lAggExpr.length/rAggExpr.length)个
     val (rightBoolIndex,rightBoolIndex_ExprID, right_cols) = makeBoolIndex(rFilterMap,'r')  //标记为r的是每个子查询对应的NamedExpression
     FilterMap.foreach { case (key, value) =>
       logInfo(s"FilterMap  Key: $key, Value: $value")
@@ -203,6 +250,12 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
     val combinedSet = left_cols ++ right_cols   // combinedSet即必须传递到最上层project的所有列
 
     //为每个project的output添加后续需要的列
+    val columns = extractColumnsFromAggExpressions(lAggExpr)  // 提取aggregate中agg内涉及到的所有列
+    // if (columns.nonEmpty) {val aggExprId = columns.head.exprId}
+    //val ralias = extractAliasesFromAggExpressions(rAggExpr)
+    val rAggAfter = replaceAttrRefInAggExpressions(columns, rAggExpr)  // 令right部分agg内的列ExprId与left的一致（用left的agg，替换为right的别名）
+    //logInfo(s"AggCols:$columns, rAlias:$ralias, rAggAfter:$rAggAfter")
+    logInfo(s"AggCols:$columns, rAggAfter:$rAggAfter")
     newPlan = newPlan.transformUpWithPruning(_.containsPattern(PROJECT), UnknownRuleId) {
       case project @ Project(projectList, child) =>
         val inputcols = child.output
@@ -219,21 +272,23 @@ object JoinOnKeys extends Rule[LogicalPlan] with Logging{
         )
         //logInfo(s"intersectingColumns:$intersectingColumns")
         if (intersectingColumns.nonEmpty) {
-          val newProjectList = projectList ++ intersectingColumns
+          val newProjectList = projectList ++ intersectingColumns ++ columns  // ovo
           val newProject = project.copy(projectList = newProjectList)
           newProject
         } else {
           project
         }
         }
-    // 在newPlan上Project出leftPlan和rightPlan的所有列以及布尔索引
-    newPlan = Project(NExpressions:+rightBoolIndex, newPlan.children.head.children.head)
+    // 在newPlan上Project出columns、left涉及的NamedExpression、right部分的NamedExpression
+    newPlan = Project(columns++NExpressions:+rightBoolIndex, newPlan.children.head.children.head)
 
     // agg中的 filter(where NamedExpression0#ExprId) 中的ExprId应该和projet中相应的值相同
+    logInfo(s"lGroupExpr:$lGroupExpr")
+    logInfo(s"lAggExprBefore:$lAggExpr")
     logInfo(s"NExpressions:$NExpressions")
-    lAggExpr = insertFilterIntoAggregateLeft(lAggExpr, NExpressions)
-    logInfo(s"lAggExpr:$lAggExpr")
-    rAggExpr = insertFilterIntoAggregate(rAggExpr, rightBoolIndex, rightBoolIndex_ExprID)
+    lAggExpr = insertFilterIntoAggregateLL(rAggExpr.length,lAggExpr, NExpressions)
+    logInfo(s"lAggExprAfter:$lAggExpr")
+    rAggExpr = insertFilterIntoAggregate(rAggAfter, rightBoolIndex, rightBoolIndex_ExprID)  //
 
     logInfo(s"length: left=${lAggExpr.length}, right=${rAggExpr.length}")
     logInfo(s"Agg: left=${lAggExpr}, right=${rAggExpr}")
